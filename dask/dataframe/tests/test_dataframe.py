@@ -1,3 +1,4 @@
+from datetime import datetime
 from operator import getitem
 
 import pandas as pd
@@ -8,25 +9,66 @@ import dask
 from dask.async import get_sync
 from dask.utils import raises
 import dask.dataframe as dd
-from dask.dataframe.core import (get, concat, repartition_divisions, _loc,
+from dask.dataframe.core import (concat, repartition_divisions, _loc,
         _coerce_loc_index)
+from dask.dataframe.core import (concat, repartition_divisions, _loc,
+        _coerce_loc_index, _concat)
 
 
-def eq(a, b):
-    if hasattr(a, 'dask'):
-        a = a.compute(get=get_sync)
-    if hasattr(b, 'dask'):
-        b = b.compute(get=get_sync)
+def check_dask(dsk, check_names=True):
+    if hasattr(dsk, 'dask'):
+        result = dsk.compute(get=get_sync)
+        if isinstance(dsk, dd.Index):
+            assert isinstance(result, pd.Index)
+        elif isinstance(dsk, dd.Series):
+            assert isinstance(result, pd.Series)
+            assert isinstance(dsk.columns, tuple)
+            assert len(dsk.columns) == 1
+            if check_names:
+                assert dsk.name == result.name, (dsk.name, result.name)
+        elif isinstance(dsk, dd.DataFrame):
+            assert isinstance(result, pd.DataFrame), type(result)
+            assert isinstance(dsk.columns, tuple)
+            if check_names:
+                columns = pd.Index(dsk.columns)
+                tm.assert_index_equal(columns, result.columns)
+        elif isinstance(dsk, dd.core.Scalar):
+            assert np.isscalar(result)
+        else:
+            msg = 'Unsupported dask instance {0} found'.format(type(dsk))
+            raise AssertionError(msg)
+        return result
+    return dsk
+
+
+def eq(a, b, check_names=True):
+    a = check_dask(a, check_names=check_names)
+    b = check_dask(b, check_names=check_names)
     if isinstance(a, pd.DataFrame):
         a = a.sort_index()
         b = b.sort_index()
         tm.assert_frame_equal(a, b)
-        return True
-    if isinstance(a, pd.Series):
+    elif isinstance(a, pd.Series):
         tm.assert_series_equal(a, b)
-        return True
-    assert np.allclose(a, b)
+    elif isinstance(a, pd.Index):
+        tm.assert_index_equal(a, b)
+    else:
+        assert np.allclose(a, b)
     return True
+
+
+def assert_dask_graph(dask, label):
+    if hasattr(dask, 'dask'):
+        dask = dask.dask
+    assert isinstance(dask, dict)
+    for k in dask:
+        if isinstance(k, tuple):
+            k = k[0]
+        if k.startswith(label):
+            return True
+    else:
+        msg = "given dask graph doesn't contan label: {0}"
+        raise AssertionError(msg.format(label))
 
 
 dsk = {('x', 0): pd.DataFrame({'a': [1, 2, 3], 'b': [4, 5, 6]},
@@ -49,8 +91,6 @@ def test_Dataframe():
 
     assert list(d.columns) == list(['a', 'b'])
 
-    assert eq(d.head(2), dsk[('x', 0)].head(2))
-    assert eq(d['a'].head(2), dsk[('x', 0)]['a'].head(2))
 
     full = d.compute()
     assert eq(d[d['b'] > 2], full[full['b'] > 2])
@@ -65,11 +105,45 @@ def test_Dataframe():
     assert repr(d)
 
 
+def test_head_tail():
+    assert eq(d.head(2), full.head(2))
+    assert eq(d.head(3), full.head(3))
+    assert eq(d.head(2), dsk[('x', 0)].head(2))
+    assert eq(d['a'].head(2), full['a'].head(2))
+    assert eq(d['a'].head(3), full['a'].head(3))
+    assert eq(d['a'].head(2), dsk[('x', 0)]['a'].head(2))
+    assert sorted(d.head(2, compute=False).dask) == \
+           sorted(d.head(2, compute=False).dask)
+    assert sorted(d.head(2, compute=False).dask) != \
+           sorted(d.head(3, compute=False).dask)
+
+    assert eq(d.tail(2), full.tail(2))
+    assert eq(d.tail(3), full.tail(3))
+    assert eq(d.tail(2), dsk[('x', 2)].tail(2))
+    assert eq(d['a'].tail(2), full['a'].tail(2))
+    assert eq(d['a'].tail(3), full['a'].tail(3))
+    assert eq(d['a'].tail(2), dsk[('x', 2)]['a'].tail(2))
+    assert sorted(d.tail(2, compute=False).dask) == \
+           sorted(d.tail(2, compute=False).dask)
+    assert sorted(d.tail(2, compute=False).dask) != \
+           sorted(d.tail(3, compute=False).dask)
+
+
 def test_Series():
     assert isinstance(d.a, dd.Series)
     assert isinstance(d.a + 1, dd.Series)
+    assert eq((d + 1), full + 1)
+    assert repr(d.a).startswith('dd.Series')
 
-    tm.assert_frame_equal((d + 1).compute(), full + 1)
+
+def test_Index():
+    for case in [pd.DataFrame(np.random.randn(10, 5), index=list('abcdefghij')),
+                 pd.DataFrame(np.random.randn(10, 5),
+                    index=pd.date_range('2011-01-01', freq='D', periods=10))]:
+        ddf = dd.from_pandas(case, 3)
+        assert eq(ddf.index, case.index)
+        assert repr(ddf.index).startswith('dd.Index')
+        assert raises(AttributeError, lambda: ddf.index.index)
 
 
 def test_attributes():
@@ -106,8 +180,8 @@ def test_set_index():
     # assert eq(d3, full.set_index(full.b).sort())
     assert str(d3.compute().sort(['a'])) == str(full.set_index(full.b).sort(['a']))
 
-    d2 = d.set_index('b')
-    assert str(d2.compute().sort(['a'])) == str(full.set_index('b').sort(['a']))
+    d4 = d.set_index('b')
+    assert str(d4.compute().sort(['a'])) == str(full.set_index('b').sort(['a']))
 
 
 def test_split_apply_combine_on_series():
@@ -120,14 +194,84 @@ def test_split_apply_combine_on_series():
     d = dd.DataFrame(dsk, 'x', ['a', 'b'], [0, 4, 9, 9])
     full = d.compute()
 
-    assert eq(d.groupby('b').a.sum(), full.groupby('b').a.sum())
-    assert eq(d.groupby(d.b + 1).a.sum(), full.groupby(full.b + 1).a.sum())
-    assert eq(d.groupby('b').a.min(), full.groupby('b').a.min())
-    assert eq(d.groupby('a').b.max(), full.groupby('a').b.max())
-    assert eq(d.groupby('b').a.count(), full.groupby('b').a.count())
+    for ddkey, pdkey in [('b', 'b'), (d.b, full.b),
+                         (d.b + 1, full.b + 1)]:
+        assert eq(d.groupby(ddkey).a.sum(), full.groupby(pdkey).a.sum())
+        assert eq(d.groupby(ddkey).a.min(), full.groupby(pdkey).a.min())
+        assert eq(d.groupby(ddkey).a.max(), full.groupby(pdkey).a.max())
+        assert eq(d.groupby(ddkey).a.count(), full.groupby(pdkey).a.count())
+        assert eq(d.groupby(ddkey).a.mean(), full.groupby(pdkey).a.mean())
+        assert eq(d.groupby(ddkey).a.nunique(), full.groupby(pdkey).a.nunique())
 
-    assert eq(d.groupby('a').b.mean(), full.groupby('a').b.mean())
-    assert eq(d.groupby(d.a > 3).b.mean(), full.groupby(full.a > 3).b.mean())
+        assert eq(d.groupby(ddkey).sum(), full.groupby(pdkey).sum())
+        assert eq(d.groupby(ddkey).min(), full.groupby(pdkey).min())
+        assert eq(d.groupby(ddkey).max(), full.groupby(pdkey).max())
+        assert eq(d.groupby(ddkey).count(), full.groupby(pdkey).count())
+        assert eq(d.groupby(ddkey).mean(), full.groupby(pdkey).mean())
+
+    for i in range(8):
+        assert eq(d.groupby(d.b > i).a.sum(), full.groupby(full.b > i).a.sum())
+        assert eq(d.groupby(d.b > i).a.min(), full.groupby(full.b > i).a.min())
+        assert eq(d.groupby(d.b > i).a.max(), full.groupby(full.b > i).a.max())
+        assert eq(d.groupby(d.b > i).a.count(), full.groupby(full.b > i).a.count())
+        assert eq(d.groupby(d.b > i).a.mean(), full.groupby(full.b > i).a.mean())
+        assert eq(d.groupby(d.b > i).a.nunique(), full.groupby(full.b > i).a.nunique())
+
+        assert eq(d.groupby(d.a > i).b.sum(), full.groupby(full.a > i).b.sum())
+        assert eq(d.groupby(d.a > i).b.min(), full.groupby(full.a > i).b.min())
+        assert eq(d.groupby(d.a > i).b.max(), full.groupby(full.a > i).b.max())
+        assert eq(d.groupby(d.a > i).b.count(), full.groupby(full.a > i).b.count())
+        assert eq(d.groupby(d.a > i).b.mean(), full.groupby(full.a > i).b.mean())
+        assert eq(d.groupby(d.a > i).b.nunique(), full.groupby(full.a > i).b.nunique())
+
+        assert eq(d.groupby(d.b > i).sum(), full.groupby(full.b > i).sum())
+        assert eq(d.groupby(d.b > i).min(), full.groupby(full.b > i).min())
+        assert eq(d.groupby(d.b > i).max(), full.groupby(full.b > i).max())
+        assert eq(d.groupby(d.b > i).count(), full.groupby(full.b > i).count())
+        assert eq(d.groupby(d.b > i).mean(), full.groupby(full.b > i).mean())
+
+        assert eq(d.groupby(d.a > i).sum(), full.groupby(full.a > i).sum())
+        assert eq(d.groupby(d.a > i).min(), full.groupby(full.a > i).min())
+        assert eq(d.groupby(d.a > i).max(), full.groupby(full.a > i).max())
+        assert eq(d.groupby(d.a > i).count(), full.groupby(full.a > i).count())
+        assert eq(d.groupby(d.a > i).mean(), full.groupby(full.a > i).mean())
+
+    for ddkey, pdkey in [('a', 'a'), (d.a, full.a),
+                         (d.a + 1, full.a + 1), (d.a > 3, full.a > 3)]:
+        assert eq(d.groupby(ddkey).b.sum(), full.groupby(pdkey).b.sum())
+        assert eq(d.groupby(ddkey).b.min(), full.groupby(pdkey).b.min())
+        assert eq(d.groupby(ddkey).b.max(), full.groupby(pdkey).b.max())
+        assert eq(d.groupby(ddkey).b.count(), full.groupby(pdkey).b.count())
+        assert eq(d.groupby(ddkey).b.mean(), full.groupby(pdkey).b.mean())
+        assert eq(d.groupby(ddkey).b.nunique(), full.groupby(pdkey).b.nunique())
+
+        assert eq(d.groupby(ddkey).sum(), full.groupby(pdkey).sum())
+        assert eq(d.groupby(ddkey).min(), full.groupby(pdkey).min())
+        assert eq(d.groupby(ddkey).max(), full.groupby(pdkey).max())
+        assert eq(d.groupby(ddkey).count(), full.groupby(pdkey).count())
+        assert eq(d.groupby(ddkey).mean(), full.groupby(pdkey).mean().astype(float))
+
+    assert sorted(d.groupby('b').a.sum().dask) == \
+           sorted(d.groupby('b').a.sum().dask)
+    assert sorted(d.groupby(d.a > 3).b.mean().dask) == \
+           sorted(d.groupby(d.a > 3).b.mean().dask)
+
+    assert_dask_graph(d.groupby('b').a.sum(), 'series-groupby-sum')
+    assert_dask_graph(d.groupby('b').a.min(), 'series-groupby-min')
+    assert_dask_graph(d.groupby('b').a.max(), 'series-groupby-max')
+    assert_dask_graph(d.groupby('b').a.count(), 'series-groupby-count')
+    # mean consists from sum and count operations
+    assert_dask_graph(d.groupby('b').a.mean(), 'series-groupby-sum')
+    assert_dask_graph(d.groupby('b').a.mean(), 'series-groupby-count')
+    assert_dask_graph(d.groupby('b').a.nunique(), 'series-groupby-nunique')
+
+    assert_dask_graph(d.groupby('b').sum(), 'dataframe-groupby-sum')
+    assert_dask_graph(d.groupby('b').min(), 'dataframe-groupby-min')
+    assert_dask_graph(d.groupby('b').max(), 'dataframe-groupby-max')
+    assert_dask_graph(d.groupby('b').count(), 'dataframe-groupby-count')
+    # mean consists from sum and count operations
+    assert_dask_graph(d.groupby('b').mean(), 'dataframe-groupby-sum')
+    assert_dask_graph(d.groupby('b').mean(), 'dataframe-groupby-count')
 
 
 def test_arithmetic():
@@ -189,82 +333,10 @@ def test_arithmetic():
 
 
 def test_arithmetic_frame():
-    tm.assert_frame_equal((d + d).compute(), full + full)
-    tm.assert_frame_equal((d * d).compute(), full * full)
-    tm.assert_frame_equal((d - d).compute(), full - full)
-    tm.assert_frame_equal((d / d).compute(), full / full)
-    tm.assert_frame_equal((d & d).compute(), full & full)
-    tm.assert_frame_equal((d | d).compute(), full | full)
-    tm.assert_frame_equal((d ^ d).compute(), full ^ full)
-    tm.assert_frame_equal((d // d).compute(), full // full)
-    tm.assert_frame_equal((d ** d).compute(), full ** full)
-    tm.assert_frame_equal((d % d).compute(), full % full)
-    tm.assert_frame_equal((d > d).compute(), full > full)
-    tm.assert_frame_equal((d < d).compute(), full < full)
-    tm.assert_frame_equal((d >= d).compute(), full >= full)
-    tm.assert_frame_equal((d <= d).compute(), full <= full)
-    tm.assert_frame_equal((d == d).compute(), full == full)
-    tm.assert_frame_equal((d != d).compute(), full != full)
-
-    tm.assert_frame_equal((d + 2).compute(), full + 2)
-    tm.assert_frame_equal((d * 2).compute(), full * 2)
-    tm.assert_frame_equal((d - 2).compute(), full - 2)
-    tm.assert_frame_equal((d / 2).compute(), full / 2)
-    tm.assert_frame_equal((d & True).compute(), full & True)
-    tm.assert_frame_equal((d | True).compute(), full | True)
-    tm.assert_frame_equal((d ^ True).compute(), full ^ True)
-    tm.assert_frame_equal((d // 2).compute(), full // 2)
-    tm.assert_frame_equal((d ** 2).compute(), full ** 2)
-    tm.assert_frame_equal((d % 2).compute(), full % 2)
-    tm.assert_frame_equal((d > 2).compute(), full > 2)
-    tm.assert_frame_equal((d < 2).compute(), full < 2)
-    tm.assert_frame_equal((d >= 2).compute(), full >= 2)
-    tm.assert_frame_equal((d <= 2).compute(), full <= 2)
-    tm.assert_frame_equal((d == 2).compute(), full == 2)
-    tm.assert_frame_equal((d != 2).compute(), full != 2)
-
-    tm.assert_frame_equal((2 + d).compute(), 2 + full)
-    tm.assert_frame_equal((2 * d).compute(), 2 * full)
-    tm.assert_frame_equal((2 - d).compute(), 2 - full)
-    tm.assert_frame_equal((2 / d).compute(), 2 / full)
-    tm.assert_frame_equal((True & d).compute(), True & full)
-    tm.assert_frame_equal((True | d).compute(), True | full)
-    tm.assert_frame_equal((True ^ d).compute(), True ^ full)
-    tm.assert_frame_equal((2 // d).compute(), 2 // full)
-    tm.assert_frame_equal((2 ** d).compute(), 2 ** full)
-    tm.assert_frame_equal((2 % d).compute(), 2 % full)
-    tm.assert_frame_equal((2 > d).compute(), 2 > full)
-    tm.assert_frame_equal((2 < d).compute(), 2 < full)
-    tm.assert_frame_equal((2 >= d).compute(), 2 >= full)
-    tm.assert_frame_equal((2 <= d).compute(), 2 <= full)
-    tm.assert_frame_equal((2 == d).compute(), 2 == full)
-    tm.assert_frame_equal((2 != d).compute(), 2 != full)
-
-    tm.assert_frame_equal((-d).compute(), -full)
-    tm.assert_frame_equal((abs(d)).compute(), abs(full))
-    tm.assert_frame_equal((~(d == d)).compute(), ~(full == full))
-
     d2 = dd.from_pandas(pd.DataFrame({'x': [1, 2, 3, 4], 'y': [5, 6, 7, 8]}), 3)
     d3 = dd.from_pandas(pd.DataFrame({'x': [5, 6, 7, 8], 'y': [2, 4, 5, 3]}), 2)
     full2 = d2.compute()
     full3 = d3.compute()
-
-    tm.assert_frame_equal((d2 + d3).compute(), full2 + full3)
-    tm.assert_frame_equal((d2 * d3).compute(), full2 * full3)
-    tm.assert_frame_equal((d2 - d3).compute(), full2 - full3)
-    tm.assert_frame_equal((d2 / d3).compute(), full2 / full3)
-    tm.assert_frame_equal((d2 & d3).compute(), full2 & full3)
-    tm.assert_frame_equal((d2 | d3).compute(), full2 | full3)
-    tm.assert_frame_equal((d2 ^ d3).compute(), full2 ^ full3)
-    tm.assert_frame_equal((d2 // d3).compute(), full2 // full3)
-    tm.assert_frame_equal((d2 ** d3).compute(), full2 ** full3)
-    tm.assert_frame_equal((d2 % d3).compute(), full2 % full3)
-    tm.assert_frame_equal((d2 > d3).compute(), full2 > full3)
-    tm.assert_frame_equal((d2 < d3).compute(), full2 < full3)
-    tm.assert_frame_equal((d2 >= d3).compute(), full2 >= full3)
-    tm.assert_frame_equal((d2 <= d3).compute(), full2 <= full3)
-    tm.assert_frame_equal((d2 == d3).compute(), full2 == full3)
-    tm.assert_frame_equal((d2 != d3).compute(), full2 != full3)
 
     dsk4 = {('y', 0): pd.DataFrame({'a': [3, 2, 1], 'b': [7, 8, 9]},
                                    index=[0, 1, 3]),
@@ -275,22 +347,67 @@ def test_arithmetic_frame():
 
     d4 = dd.DataFrame(dsk4, 'y', ['a', 'b'], [0, 4, 9, 9])
     full4 = d4.compute()
-    tm.assert_frame_equal((d + d4).compute(), full + full4)
-    tm.assert_frame_equal((d * d4).compute(), full * full4)
-    tm.assert_frame_equal((d - d4).compute(), full - full4)
-    tm.assert_frame_equal((d / d4).compute(), full / full4)
-    tm.assert_frame_equal((d & d4).compute(), full & full4)
-    tm.assert_frame_equal((d | d4).compute(), full | full4)
-    tm.assert_frame_equal((d ^ d4).compute(), full ^ full4)
-    tm.assert_frame_equal((d // d4).compute(), full // full4)
-    tm.assert_frame_equal((d ** d4).compute(), full ** full4)
-    tm.assert_frame_equal((d % d4).compute(), full % full4)
-    tm.assert_frame_equal((d > d4).compute(), full > full4)
-    tm.assert_frame_equal((d < d4).compute(), full < full4)
-    tm.assert_frame_equal((d >= d4).compute(), full >= full4)
-    tm.assert_frame_equal((d <= d4).compute(), full <= full4)
-    tm.assert_frame_equal((d == d4).compute(), full == full4)
-    tm.assert_frame_equal((d != d4).compute(), full != full4)
+
+    cases = [(d, d, full, full),
+             (d2, d3, full2, full3),
+             (d, d4, full, full4)]
+    for (l, r, el, er) in cases:
+
+        assert eq(l + r, el + er)
+        assert eq(l * r, el * er)
+        assert eq(l - r, el - er)
+        assert eq(l / r, el / er)
+        assert eq(l & r, el & er)
+        assert eq(l | r, el | er)
+        assert eq(l ^ r, el ^ er)
+        assert eq(l // r, el // er)
+        assert eq(l ** r, el ** er)
+        assert eq(l % r, el % er)
+        assert eq(l > r, el > er)
+        assert eq(l < r, el < er)
+        assert eq(l >= r, el >= er)
+        assert eq(l <= r, el <= er)
+        assert eq(l == r, el == er)
+        assert eq(l != r, el != er)
+
+        assert eq(l + 2, el + 2)
+        assert eq(l * 2, el * 2)
+        assert eq(l - 2, el - 2)
+        assert eq(l / 2, el / 2)
+        assert eq(l & True, el & True)
+        assert eq(l | True, el | True)
+        assert eq(l ^ True, el ^ True)
+        assert eq(l // 2, el // 2)
+        assert eq(l ** 2, el ** 2)
+        assert eq(l % 2, el % 2)
+        assert eq(l > 2, el > 2)
+        assert eq(l < 2, el < 2)
+        assert eq(l >= 2, el >= 2)
+        assert eq(l <= 2, el <= 2)
+        assert eq(l == 2, el == 2)
+        assert eq(l != 2, el != 2)
+
+        assert eq(2 + l, 2 + el)
+        assert eq(2 * l, 2 * el)
+        assert eq(2 - l, 2 - el)
+        assert eq(2 / l, 2 / el)
+        assert eq(True & l, True & el)
+        assert eq(True | l, True | el)
+        assert eq(True ^ l, True ^ el)
+        assert eq(2 // l, 2 // el)
+        assert eq(2 ** l, 2 ** el)
+        assert eq(2 % l, 2 % el)
+        assert eq(2 > l, 2 > el)
+        assert eq(2 < l, 2 < el)
+        assert eq(2 >= l, 2 >= el)
+        assert eq(2 <= l, 2 <= el)
+        assert eq(2 == l, 2 == el)
+        assert eq(2 != l, 2 != el)
+
+        assert eq(-l, -el)
+        assert eq(abs(l), abs(el))
+        assert eq(~(l == r), ~(el == er))
+
 
     dsk5 = {('z', 0): pd.DataFrame({'a': [3, 2, 1], 'b': [7, 8, 9]},
                                    index=[0, 1, 3]),
@@ -303,14 +420,83 @@ def test_arithmetic_frame():
 
 
 def test_reductions():
-    assert eq(d.b.sum(), full.b.sum())
-    assert eq(d.b.min(), full.b.min())
-    assert eq(d.b.max(), full.b.max())
-    assert eq(d.b.count(), full.b.count())
-    assert eq(d.b.std(), full.b.std())
-    assert eq(d.b.var(), full.b.var())
-    assert eq(d.b.mean(), full.b.mean())
+    for dds, pds in [(d.b, full.b), (d.a, full.a),
+                   (d['a'], full['a']), (d['b'], full['b'])]:
+        assert eq(dds.sum(), pds.sum())
+        assert eq(dds.min(), pds.min())
+        assert eq(dds.max(), pds.max())
+        assert eq(dds.count(), pds.count())
+        assert eq(dds.std(), pds.std())
+        assert eq(dds.var(), pds.var())
+        assert eq(dds.std(ddof=0), pds.std(ddof=0))
+        assert eq(dds.var(ddof=0), pds.var(ddof=0))
+        assert eq(dds.mean(), pds.mean())
+        assert eq(dds.nunique(), pds.nunique())
 
+    assert_dask_graph(d.b.sum(), 'series-sum')
+    assert_dask_graph(d.b.min(), 'series-min')
+    assert_dask_graph(d.b.max(), 'series-max')
+    assert_dask_graph(d.b.count(), 'series-count')
+    assert_dask_graph(d.b.std(), 'series-std(ddof=1)')
+    assert_dask_graph(d.b.var(), 'series-var(ddof=1)')
+    assert_dask_graph(d.b.std(ddof=0), 'series-std(ddof=0)')
+    assert_dask_graph(d.b.var(ddof=0), 'series-var(ddof=0)')
+    assert_dask_graph(d.b.mean(), 'series-mean')
+    # nunique is performed using drop-duplicates
+    assert_dask_graph(d.b.nunique(), 'drop-duplicates')
+
+
+def test_reductions_frame():
+    assert eq(d.sum(), full.sum())
+    assert eq(d.min(), full.min())
+    assert eq(d.max(), full.max())
+    assert eq(d.count(), full.count())
+    assert eq(d.std(), full.std())
+    assert eq(d.var(), full.var())
+    assert eq(d.std(ddof=0), full.std(ddof=0))
+    assert eq(d.var(ddof=0), full.var(ddof=0))
+    assert eq(d.mean(), full.mean())
+
+    for axis in [0, 1, 'index', 'columns']:
+        assert eq(d.sum(axis=axis), full.sum(axis=axis))
+        assert eq(d.min(axis=axis), full.min(axis=axis))
+        assert eq(d.max(axis=axis), full.max(axis=axis))
+        assert eq(d.count(axis=axis), full.count(axis=axis))
+        assert eq(d.std(axis=axis), full.std(axis=axis))
+        assert eq(d.var(axis=axis), full.var(axis=axis))
+        assert eq(d.std(axis=axis, ddof=0), full.std(axis=axis, ddof=0))
+        assert eq(d.var(axis=axis, ddof=0), full.var(axis=axis, ddof=0))
+        assert eq(d.mean(axis=axis), full.mean(axis=axis))
+
+    assert raises(ValueError, lambda: d.sum(axis='incorrect').compute())
+
+    assert_dask_graph(d.sum(), 'dataframe-sum')
+    assert_dask_graph(d.min(), 'dataframe-min')
+    assert_dask_graph(d.max(), 'dataframe-max')
+    assert_dask_graph(d.count(), 'dataframe-count')
+    # std, var, mean consists from sum and count operations
+    assert_dask_graph(d.std(), 'dataframe-sum')
+    assert_dask_graph(d.std(), 'dataframe-count')
+    assert_dask_graph(d.var(), 'dataframe-sum')
+    assert_dask_graph(d.var(), 'dataframe-count')
+    assert_dask_graph(d.mean(), 'dataframe-sum')
+    assert_dask_graph(d.mean(), 'dataframe-count')
+
+def test_reductions_frame_dtypes():
+    df = pd.DataFrame({'int': [1, 2, 3, 4, 5, 6, 7, 8],
+                       'float': [1., 2., 3., 4., np.nan, 6., 7., 8.],
+                       'dt': [pd.NaT] + [datetime(2011, i, 1) for i in range(1, 8)],
+                       'str': list('abcdefgh')})
+    ddf = dd.from_pandas(df, 3)
+    assert eq(df.sum(), ddf.sum())
+    assert eq(df.min(), ddf.min())
+    assert eq(df.max(), ddf.max())
+    assert eq(df.count(), ddf.count())
+    assert eq(df.std(), ddf.std())
+    assert eq(df.var(), ddf.var())
+    assert eq(df.std(ddof=0), ddf.std(ddof=0))
+    assert eq(df.var(ddof=0), ddf.var(ddof=0))
+    assert eq(df.mean(), ddf.mean())
 
 def test_dropna():
     df = pd.DataFrame({'x': [np.nan, 2,      3, 4, np.nan,      6],
@@ -323,28 +509,86 @@ def test_dropna():
     assert eq(ddf.y.dropna(), df.y.dropna())
     assert eq(ddf.z.dropna(), df.z.dropna())
 
-    tm.assert_frame_equal(ddf.dropna().compute(), df.dropna())
-    tm.assert_frame_equal(ddf.dropna(how='all').compute(), df.dropna(how='all'))
-    tm.assert_frame_equal(ddf.dropna(subset=['x']).compute(), df.dropna(subset=['x']))
-    tm.assert_frame_equal(ddf.dropna(subset=['y', 'z']).compute(),
-                          df.dropna(subset=['y', 'z']))
-    tm.assert_frame_equal(ddf.dropna(subset=['y', 'z'], how='all').compute(),
-                          df.dropna(subset=['y', 'z'], how='all'))
+    assert eq(ddf.dropna(), df.dropna())
+    assert eq(ddf.dropna(how='all'), df.dropna(how='all'))
+    assert eq(ddf.dropna(subset=['x']), df.dropna(subset=['x']))
+    assert eq(ddf.dropna(subset=['y', 'z']), df.dropna(subset=['y', 'z']))
+    assert eq(ddf.dropna(subset=['y', 'z'], how='all'),
+              df.dropna(subset=['y', 'z'], how='all'))
 
 
 def test_map_partitions_multi_argument():
-    assert eq(dd.map_partitions(lambda a, b: a + b, 'c', d.a, d.b),
+    assert eq(dd.map_partitions(lambda a, b: a + b, None, d.a, d.b),
               full.a + full.b)
-    assert eq(dd.map_partitions(lambda a, b, c: a + b + c, 'c', d.a, d.b, 1),
+    assert eq(dd.map_partitions(lambda a, b, c: a + b + c, None, d.a, d.b, 1),
               full.a + full.b + 1)
 
 
 def test_map_partitions():
-    assert eq(d.map_partitions(lambda df: df, 'a'), full)
+    assert eq(d.map_partitions(lambda df: df, columns=d.columns), full)
+    assert eq(d.map_partitions(lambda df: df), full)
+    result = d.map_partitions(lambda df: df.sum(axis=1), None)
+    assert eq(result, full.sum(axis=1))
+
+
+def test_map_partitions_names():
+    func = lambda x: x
+    assert sorted(dd.map_partitions(func, d.columns, d).dask) == \
+           sorted(dd.map_partitions(func, d.columns, d).dask)
+    assert sorted(dd.map_partitions(lambda x: x, d.columns, d, token=1).dask) == \
+           sorted(dd.map_partitions(lambda x: x, d.columns, d, token=1).dask)
+
+    func = lambda x, y: x
+    assert sorted(dd.map_partitions(func, d.columns, d, d).dask) == \
+           sorted(dd.map_partitions(func, d.columns, d, d).dask)
+
+
+def test_map_partitions_column_info():
+    df = pd.DataFrame({'x': [1, 2, 3, 4], 'y': [5, 6, 7, 8]})
+    a = dd.from_pandas(df, npartitions=2)
+
+    b = dd.map_partitions(lambda x: x, a.columns, a)
+    assert b.columns == a.columns
+    assert eq(df, b)
+
+    b = dd.map_partitions(lambda x: x, a.x.name, a.x)
+    assert b.name == a.x.name
+    assert eq(df.x, b)
+
+    b = dd.map_partitions(lambda x: x, a.x.name, a.x)
+    assert b.name == a.x.name
+    assert eq(df.x, b)
+
+    b = dd.map_partitions(lambda df: df.x + df.y, None, a)
+    assert b.name == None
+    assert isinstance(b, dd.Series)
+
+    b = dd.map_partitions(lambda df: df.x + 1, 'x', a)
+    assert isinstance(b, dd.Series)
+    assert b.name == 'x'
+
+
+def test_map_partitions_method_names():
+    df = pd.DataFrame({'x': [1, 2, 3, 4], 'y': [5, 6, 7, 8]})
+    a = dd.from_pandas(df, npartitions=2)
+
+    b = a.map_partitions(lambda x: x)
+    assert isinstance(b, dd.DataFrame)
+    assert b.columns == a.columns
+
+    b = a.map_partitions(lambda df: df.x + 1, columns=None)
+    assert isinstance(b, dd.Series)
+    assert b.name == None
+
+    b = a.map_partitions(lambda df: df.x + 1, columns='x')
+    assert isinstance(b, dd.Series)
+    assert b.name == 'x'
 
 
 def test_drop_duplicates():
     assert eq(d.a.drop_duplicates(), full.a.drop_duplicates())
+    assert eq(d.drop_duplicates(), full.drop_duplicates())
+    assert eq(d.index.drop_duplicates(), full.index.drop_duplicates())
 
 
 def test_full_groupby():
@@ -354,18 +598,28 @@ def test_full_groupby():
     def func(df):
         df['b'] = df.b - df.b.mean()
         return df
+
     assert eq(d.groupby('a').apply(func), full.groupby('a').apply(func))
+
+    assert sorted(d.groupby('a').apply(func).dask) == \
+           sorted(d.groupby('a').apply(func).dask)
 
 
 def test_groupby_on_index():
     e = d.set_index('a')
+    efull = full.set_index('a')
     assert eq(d.groupby('a').b.mean(), e.groupby(e.index).b.mean())
 
     def func(df):
-        df['b'] = df.b - df.b.mean()
+        df.loc[:, 'b'] = df.b - df.b.mean()
         return df
 
     assert eq(d.groupby('a').apply(func).set_index('a'),
+              e.groupby(e.index).apply(func))
+    assert eq(d.groupby('a').apply(func), full.groupby('a').apply(func))
+    assert eq(d.groupby('a').apply(func).set_index('a'),
+              full.groupby('a').apply(func).set_index('a'))
+    assert eq(efull.groupby(efull.index).apply(func),
               e.groupby(e.index).apply(func))
 
 
@@ -381,7 +635,18 @@ def test_set_partition_compute():
     d3 = d.set_partition('b', [0, 2, 9], compute=True)
 
     assert eq(d2, d3)
+    assert eq(d2, full.set_index('b'))
+    assert eq(d3, full.set_index('b'))
     assert len(d2.dask) > len(d3.dask)
+
+    d4 = d.set_partition(d.b, [0, 2, 9])
+    d5 = d.set_partition(d.b, [0, 2, 9], compute=True)
+    exp = full.copy()
+    exp.index = exp.b
+    assert eq(d4, d5)
+    assert eq(d4, exp)
+    assert eq(d5, exp)
+    assert len(d4.dask) > len(d5.dask)
 
 
 def test_categorize():
@@ -401,10 +666,14 @@ def test_categorize():
 
     assert list(cfull.a.astype('O')) == list(full.a)
 
-    assert (get(c.dask, c._keys()[:1])[0].dtypes == cfull.dtypes).all()
+    assert (d._get(c.dask, c._keys()[:1])[0].dtypes == cfull.dtypes).all()
 
     assert (d.categorize().compute().dtypes == 'category').all()
 
+def test_ndim():
+    assert (d.ndim == 2)
+    assert (d.a.ndim == 1)
+    assert (d.index.ndim == 1)
 
 def test_dtype():
     assert (d.dtypes == full.dtypes).all()
@@ -422,7 +691,9 @@ def test_value_counts():
     a = dd.from_pandas(df, npartitions=3)
     result = a.x.value_counts()
     expected = df.x.value_counts()
-    assert eq(result, expected)
+    # because of pandas bug, value_counts doesn't hold name (fixed in 0.17)
+    # https://github.com/pydata/pandas/pull/10419
+    assert eq(result, expected, check_names=False)
 
 
 def test_isin():
@@ -431,7 +702,7 @@ def test_isin():
 
 def test_len():
     assert len(d) == len(full)
-
+    assert len(d.a) == len(full.a)
 
 def test_quantile():
     result = d.b.quantile([.3, .7]).compute()
@@ -461,10 +732,17 @@ def test_loc():
     assert eq(d.loc[:8], full.loc[:8])
     assert eq(d.loc[3:], full.loc[3:])
 
+    assert eq(d.a.loc[5], full.a.loc[5])
+    assert eq(d.a.loc[3:8], full.a.loc[3:8])
+    assert eq(d.a.loc[:8], full.a.loc[:8])
+    assert eq(d.a.loc[3:], full.a.loc[3:])
+
     assert raises(KeyError, lambda: d.loc[1000])
     assert eq(d.loc[1000:], full.loc[1000:])
     assert eq(d.loc[-2000:-1000], full.loc[-2000:-1000])
 
+    assert sorted(d.loc[5].dask) == sorted(d.loc[5].dask)
+    assert sorted(d.loc[5].dask) != sorted(d.loc[6].dask)
 
 
 def test_loc_with_text_dates():
@@ -481,6 +759,9 @@ def test_loc_with_text_dates():
 def test_loc_with_series():
     assert eq(d.loc[d.a % 2 == 0], full.loc[full.a % 2 == 0])
 
+    assert sorted(d.loc[d.a % 2].dask) == sorted(d.loc[d.a % 2].dask)
+    assert sorted(d.loc[d.a % 2].dask) != sorted(d.loc[d.a % 3].dask)
+
 
 def test_iloc_raises():
     assert raises(AttributeError, lambda: d.iloc[:5])
@@ -496,8 +777,8 @@ def test_map():
 
 
 def test_concat():
-    x = concat([pd.DataFrame(columns=['a', 'b']),
-                pd.DataFrame(columns=['a', 'b'])])
+    x = _concat([pd.DataFrame(columns=['a', 'b']),
+                 pd.DataFrame(columns=['a', 'b'])])
     assert list(x.columns) == ['a', 'b']
     assert len(x) == 0
 
@@ -534,7 +815,7 @@ def test_unknown_divisions():
     assert raises(ValueError, lambda: d.loc[3])
 
 
-def test_concat():
+def test_concat2():
     dsk = {('x', 0): pd.DataFrame({'a': [1, 2, 3], 'b': [4, 5, 6]}),
            ('x', 1): pd.DataFrame({'a': [4, 5, 6], 'b': [3, 2, 1]}),
            ('x', 2): pd.DataFrame({'a': [7, 8, 9], 'b': [0, 0, 0]})}
@@ -549,6 +830,8 @@ def test_concat():
     assert c.npartitions == a.npartitions + b.npartitions
 
     assert eq(pd.concat([a.compute(), b.compute()]), c)
+
+    assert dd.concat([a, b]).dask == dd.concat([a, b]).dask
 
 
 def test_dataframe_series_are_dillable():
@@ -572,7 +855,7 @@ def test_random_partitions():
 def test_series_nunique():
     ps = pd.Series(list('aaabbccccdddeee'), name='a')
     s = dd.from_pandas(ps, npartitions=3)
-    assert s.nunique().compute() == ps.nunique()
+    assert eq(s.nunique(), ps.nunique())
 
 
 def test_dataframe_groupby_nunique():
@@ -581,8 +864,7 @@ def test_dataframe_groupby_nunique():
     ps = pd.DataFrame(dict(strings=strings, data=data))
     s = dd.from_pandas(ps, npartitions=3)
     expected = ps.groupby('strings')['data'].nunique()
-    result = s.groupby('strings')['data'].nunique().compute()
-    tm.assert_series_equal(result, expected)
+    assert eq(s.groupby('strings')['data'].nunique(), expected)
 
 
 def test_dataframe_groupby_nunique_across_group_same_value():
@@ -591,8 +873,7 @@ def test_dataframe_groupby_nunique_across_group_same_value():
     ps = pd.DataFrame(dict(strings=strings, data=data))
     s = dd.from_pandas(ps, npartitions=3)
     expected = ps.groupby('strings')['data'].nunique()
-    result = s.groupby('strings')['data'].nunique().compute()
-    tm.assert_series_equal(result, expected)
+    assert eq(s.groupby('strings')['data'].nunique(), expected)
 
 
 def test_set_partition_2():
@@ -613,7 +894,7 @@ def test_repartition():
     b = a.repartition(divisions=[10, 20, 50, 60])
     assert b.divisions == (10, 20, 50, 60)
     assert eq(a, b)
-    assert eq(get(b.dask, (b._name, 0)), df.iloc[:1])
+    assert eq(a._get(b.dask, (b._name, 0)), df.iloc[:1])
 
 
 def test_repartition_divisions():
@@ -663,6 +944,23 @@ def test_embarrassingly_parallel_operations():
     assert len(a.sample(0.5).compute()) < len(df)
 
 
+def test_sample():
+    df = pd.DataFrame({'x': [1, 2, 3, 4, None, 6], 'y': list('abdabd')},
+                      index=[10, 20, 30, 40, 50, 60])
+    a = dd.from_pandas(df, 2)
+
+    b = a.sample(0.5)
+
+    assert eq(b, b)
+
+    c = a.sample(0.5, random_state=1234)
+    d = a.sample(0.5, random_state=1234)
+
+    assert eq(c, d)
+
+    assert a.sample(0.5)._name != a.sample(0.5)._name
+
+
 def test_datetime_accessor():
     df = pd.DataFrame({'x': [1, 2, 3, 4]})
     df['x'] = df.x.astype('M8[us]')
@@ -671,7 +969,9 @@ def test_datetime_accessor():
 
     assert 'date' in dir(a.x.dt)
 
-    assert eq(a.x.dt.date, df.x.dt.date)
+    # pandas loses Series.name via datetime accessor
+    # see https://github.com/pydata/pandas/issues/10712
+    assert eq(a.x.dt.date, df.x.dt.date, check_names=False)
     assert (a.x.dt.to_pydatetime().compute() == df.x.dt.to_pydatetime()).all()
 
 
@@ -690,7 +990,7 @@ def test_empty_max():
     a = dd.DataFrame({('x', 0): pd.DataFrame({'x': [1]}),
                       ('x', 1): pd.DataFrame({'x': []})}, 'x',
                       ['x'], [None, None, None])
-    assert a.x.max().compute() == 1
+    assert eq(a.x.max(), 1)
 
 
 def test_loc_on_numpy_datetimes():
@@ -731,7 +1031,6 @@ def test_categorical_set_index():
     with dask.set_options(get=get_sync):
         b = a.set_index('y')
         df2 = df.set_index('y')
-
         assert list(b.index.compute()), list(df2.index)
 
         b = a.set_index(a.y)
@@ -743,3 +1042,53 @@ def test_query():
     df = pd.DataFrame({'x': [1, 2, 3, 4], 'y': [5, 6, 7, 8]})
     a = dd.from_pandas(df, npartitions=2)
     assert eq(a.query('x**2 > y'), df.query('x**2 > y'))
+
+
+def test_deterministic_arithmetic_names():
+    df = pd.DataFrame({'x': [1, 2, 3, 4], 'y': [5, 6, 7, 8]})
+    a = dd.from_pandas(df, npartitions=2)
+
+    assert sorted((a.x + a.y ** 2).dask) == sorted((a.x + a.y ** 2).dask)
+    assert sorted((a.x + a.y ** 2).dask) != sorted((a.x + a.y ** 3).dask)
+    assert sorted((a.x + a.y ** 2).dask) != sorted((a.x - a.y ** 2).dask)
+
+
+def test_deterministic_reduction_names():
+    df = pd.DataFrame({'x': [1, 2, 3, 4], 'y': [5, 6, 7, 8]})
+    a = dd.from_pandas(df, npartitions=2)
+
+    assert a.x.sum()._name == a.x.sum()._name
+    assert a.x.mean()._name == a.x.mean()._name
+    assert a.x.var()._name == a.x.var()._name
+    assert a.x.min()._name == a.x.min()._name
+    assert a.x.max()._name == a.x.max()._name
+    assert a.x.count()._name == a.x.count()._name
+
+
+def test_deterministic_apply_concat_apply_names():
+    df = pd.DataFrame({'x': [1, 2, 3, 4], 'y': [5, 6, 7, 8]})
+    a = dd.from_pandas(df, npartitions=2)
+
+    assert sorted(a.x.nlargest(2).dask) == sorted(a.x.nlargest(2).dask)
+    assert sorted(a.x.nlargest(2).dask) != sorted(a.x.nlargest(3).dask)
+    assert sorted(a.x.drop_duplicates().dask) == \
+           sorted(a.x.drop_duplicates().dask)
+    assert sorted(a.groupby('x').y.mean().dask) == \
+           sorted(a.groupby('x').y.mean().dask)
+
+
+def test_gh_517():
+    arr = np.random.randn(100, 2)
+    df = pd.DataFrame(arr, columns=['a', 'b'])
+    ddf = dd.from_pandas(df, 2)
+    assert ddf.index.nunique().compute() == 100
+
+    ddf2 = dd.from_pandas(pd.concat([df, df]), 5)
+    assert ddf2.index.nunique().compute() == 100
+
+
+def test_drop_axis_1():
+    df = pd.DataFrame({'x': [1, 2, 3, 4], 'y': [5, 6, 7, 8]})
+    a = dd.from_pandas(df, npartitions=2)
+
+    assert eq(a.drop('y', axis=1), df.drop('y', axis=1))
